@@ -15,7 +15,13 @@
 // You should have received a copy of the GNU General Public License
 // along with cph-ng.  If not, see <https://www.gnu.org/licenses/>.
 
-import type { BatchId, CompanionProblem, SubmitData } from '@cph-ng/core';
+import type {
+  AvailableBatch,
+  BatchId,
+  BatchRemovalReason,
+  CompanionProblem,
+  SubmitData,
+} from '@cph-ng/core';
 import type { IFileSystem } from '@v/application/ports/node/IFileSystem';
 import type { ICompanion } from '@v/application/ports/services/ICompanion';
 import type { ILogger } from '@v/application/ports/vscode/ILogger';
@@ -32,7 +38,6 @@ export type BatchList = Map<BatchId, CompanionProblem[]>;
 
 @injectable()
 export class Companion implements ICompanion {
-  private abortControllers: Map<BatchId, AbortController> = new Map();
   private readingProgress: Map<BatchId, (count: number, size: number) => void> = new Map();
   private batchesToClaim: BatchList = new Map();
 
@@ -49,12 +54,12 @@ export class Companion implements ICompanion {
     this.ws.signals.on('statusChanged', this.updateStatusbar);
     this.ws.signals.on('readingBatch', this.readingBatch);
     this.ws.signals.on('batchAvailable', this.batchAvailable);
-    this.ws.signals.on('batchClaimed', this.batchClaimed);
+    this.ws.signals.on('batchSnapshot', this.batchSnapshot);
+    this.ws.signals.on('batchRemoved', this.batchRemoved);
     this.statusbar.signals.on('click', this.handleStatusBarClick);
   }
 
   private removeBatch(batchId: BatchId) {
-    this.abortControllers.delete(batchId);
     this.batchesToClaim.delete(batchId);
   }
   private updateStatusbar = () => {
@@ -67,8 +72,7 @@ export class Companion implements ICompanion {
     if (this.batchesToClaim.size === 0) this.logger.info('No batches to claim');
     else if (this.batchesToClaim.size === 1) {
       const batchId = Array.from(this.batchesToClaim.keys())[0];
-      const problems = this.batchesToClaim.get(batchId);
-      if (problems) await this.claimAndImport(batchId, problems);
+      if (batchId) await this.claimAndImport(batchId);
     } else {
       const batchId = await this.ui.quickPick<BatchId>(
         Array.from(this.batchesToClaim.entries()).map(([batchId, problems]) => ({
@@ -81,10 +85,7 @@ export class Companion implements ICompanion {
         })),
         { title: this.translator.t('Select a batch to claim') },
       );
-      if (batchId) {
-        const problems = this.batchesToClaim.get(batchId);
-        if (problems) await this.claimAndImport(batchId, problems);
-      }
+      if (batchId) await this.claimAndImport(batchId);
     }
   };
 
@@ -109,25 +110,37 @@ export class Companion implements ICompanion {
     problems: CompanionProblem[],
     autoImport: boolean,
   ) => {
-    const controller = new AbortController();
-    this.abortControllers.set(batchId, controller);
     if (autoImport) {
       this.logger.info('Auto-importing batch', { batchId });
-      await this.claimAndImport(batchId, problems);
-      this.abortControllers.delete(batchId);
+      await this.claimAndImport(batchId);
     } else {
       this.batchesToClaim.set(batchId, problems);
-      controller.signal.addEventListener('abort', () => {
-        this.removeBatch(batchId);
-      });
       this.updateStatusbar();
     }
   };
 
-  private async claimAndImport(batchId: BatchId, problems: CompanionProblem[]) {
+  private batchSnapshot = (batches: AvailableBatch[]) => {
+    this.batchesToClaim = new Map(
+      batches.map(
+        ({ batchId, problems }) => [batchId, problems] satisfies [BatchId, CompanionProblem[]],
+      ),
+    );
+    this.updateStatusbar();
+  };
+
+  private async claimAndImport(batchId: BatchId) {
     try {
-      this.ws.claimBatch(batchId);
-      await this.importUseCase.exec(problems);
+      const result = await this.ws.claimBatch(batchId);
+      if (!result.ok) {
+        this.logger.info('Batch is no longer available', { batchId });
+        this.removeBatch(batchId);
+        this.updateStatusbar();
+        return;
+      }
+
+      this.removeBatch(batchId);
+      this.updateStatusbar();
+      await this.importUseCase.exec(result.problems);
     } catch (e) {
       this.logger.error('Failed to import companion problems', e);
       this.ui.alert(
@@ -137,10 +150,9 @@ export class Companion implements ICompanion {
     }
   }
 
-  private batchClaimed = (batchId: BatchId) => {
-    this.logger.info('Batch claimed', { batchId });
-    const controller = this.abortControllers.get(batchId);
-    if (controller) controller.abort();
+  private batchRemoved = (batchId: BatchId, reason: BatchRemovalReason) => {
+    this.logger.info('Batch removed', { batchId, reason });
+    this.removeBatch(batchId);
     this.updateStatusbar();
   };
 

@@ -18,8 +18,11 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import EventEmitter from 'node:events';
 import type {
+  AvailableBatch,
   BatchId,
+  BatchRemovalReason,
   C2rMsg,
+  ClaimBatchResult,
   ClientId,
   CompanionProblem,
   R2cMsg,
@@ -50,7 +53,8 @@ type CompanionCommunicationEvents = {
   statusChanged: () => void;
   readingBatch: (batchId: BatchId, count: number, size: number) => void;
   batchAvailable: (batchId: BatchId, problems: CompanionProblem[], autoImport: boolean) => void;
-  batchClaimed: (batchId: BatchId) => void;
+  batchSnapshot: (batches: AvailableBatch[]) => void;
+  batchRemoved: (batchId: BatchId, reason: BatchRemovalReason) => void;
 };
 
 export type RouterStatus = 'OFFLINE' | 'STARTING' | 'CONNECTING' | 'ONLINE' | 'FAILED';
@@ -145,8 +149,17 @@ export class CompanionCommunicationService {
     this.ws?.emit('cancelBatch', { batchId });
   }
 
-  public claimBatch(batchId: BatchId) {
-    this.ws?.emit('claimBatch', { batchId });
+  public async claimBatch(batchId: BatchId): Promise<ClaimBatchResult> {
+    if (!this.ws?.connected)
+      return {
+        ok: false,
+        batchId,
+        reason: 'not-available',
+      };
+
+    return (await this.ws
+      .timeout(ROUTER_CONNECT_TIMEOUT_MS)
+      .emitWithAck('claimBatch', { batchId })) as ClaimBatchResult;
   }
 
   public submit(data: SubmitData) {
@@ -448,10 +461,20 @@ export class CompanionCommunicationService {
       });
       this.signals.emit('batchAvailable', msg.batchId, msg.problems, msg.autoImport);
     });
-    socket.on('batchClaimed', (msg) => {
+    socket.on('batchSnapshot', (msg) => {
       if (socket !== this.ws) return;
-      this.logger.trace(`Received batchClaimed message`, { batchId: msg.batchId });
-      this.signals.emit('batchClaimed', msg.batchId);
+      this.logger.trace(`Received batchSnapshot message`, {
+        batchCount: msg.batches.length,
+      });
+      this.signals.emit('batchSnapshot', msg.batches);
+    });
+    socket.on('batchRemoved', (msg) => {
+      if (socket !== this.ws) return;
+      this.logger.trace(`Received batchRemoved message`, {
+        batchId: msg.batchId,
+        reason: msg.reason,
+      });
+      this.signals.emit('batchRemoved', msg.batchId, msg.reason);
     });
     socket.on('browserStatus', (msg) => {
       if (socket !== this.ws) return;

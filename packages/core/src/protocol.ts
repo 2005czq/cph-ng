@@ -64,15 +64,31 @@ export interface SubmitData {
   sourceCode: string;
 }
 
+export interface AvailableBatch {
+  batchId: BatchId;
+  problems: CompanionProblem[];
+}
+
+export type BatchRemovalReason = 'claimed' | 'cancelled' | 'expired';
+
+export type ClaimBatchResult =
+  | {
+      ok: true;
+      batchId: BatchId;
+      problems: CompanionProblem[];
+    }
+  | {
+      ok: false;
+      batchId: BatchId;
+      reason: 'not-available';
+    };
+
 // Router -> Client
 export interface R2cMsg {
   readingBatch: (msg: { batchId: BatchId; count: number; size: number }) => void;
-  batchAvailable: (msg: {
-    batchId: BatchId;
-    problems: CompanionProblem[];
-    autoImport: boolean;
-  }) => void;
-  batchClaimed: (msg: { batchId: BatchId }) => void;
+  batchAvailable: (msg: AvailableBatch & { autoImport: boolean }) => void;
+  batchSnapshot: (msg: { batches: AvailableBatch[] }) => void;
+  batchRemoved: (msg: { batchId: BatchId; reason: BatchRemovalReason }) => void;
   log: (msg: { level: LogLevel; message: string; details?: unknown }) => void;
   browserStatus: (msg: { connected: boolean }) => void;
 }
@@ -86,7 +102,7 @@ export interface R2bMsg {
 // Client -> Router Messages
 export interface C2rMsg {
   cancelBatch: (msg: { batchId: BatchId }) => void;
-  claimBatch: (msg: { batchId: BatchId }) => void;
+  claimBatch: (msg: { batchId: BatchId }, ack: (result: ClaimBatchResult) => void) => void;
   submit: (msg: SubmitData) => void;
   updateConfig: (msg: { config: Partial<RouterConfig> }) => void;
 }

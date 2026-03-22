@@ -17,7 +17,6 @@
 
 import type {
   B2rMsg,
-  BatchId,
   C2rMsg,
   CompanionProblem,
   LogLevel,
@@ -30,6 +29,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { Server } from 'socket.io';
+import { BatchStore } from './batchStore';
 import { type LogFileLockRelease, parseRouterConfig, prepareLogFile } from './config';
 import { configureLogger, error, info, trace, warn } from './logger';
 
@@ -39,6 +39,7 @@ type RouterProcessMessage =
 
 const ROUTER_PING_INTERVAL_MS = 5000;
 const ROUTER_PING_TIMEOUT_MS = 5000;
+const AVAILABLE_BATCH_TTL_MS = 10 * 60 * 1000;
 
 let io: Server<C2rMsg & B2rMsg, R2cMsg & R2bMsg> | undefined;
 let server: ReturnType<typeof serve> | undefined;
@@ -47,11 +48,6 @@ let releaseLogFileLock: LogFileLockRelease | undefined;
 let isShuttingDown = false;
 let activeBrowserId: string | null = null;
 let shutdownTimer: NodeJS.Timeout | null = null;
-
-export const batches = new Map<
-  BatchId,
-  { ignored: boolean; problems: CompanionProblem[]; size: number }
->();
 
 const app = new Hono();
 
@@ -74,6 +70,28 @@ const getRoomSize = (roomName: string): number =>
 
 const hasConnectedClients = (): boolean =>
   getRoomSize('vscode-clients') + getRoomSize('browsers') > 0;
+
+const batchStore = new BatchStore({
+  availableBatchTtlMs: AVAILABLE_BATCH_TTL_MS,
+  isAutoImportEnabled: () => getRoomSize('vscode-clients') === 1,
+  onReadingBatch: (batchId, count, size) => {
+    io?.to('vscode-clients').emit('readingBatch', { batchId, count, size });
+  },
+  onBatchAvailable: (batch, autoImport) => {
+    io?.to('vscode-clients').emit('batchAvailable', {
+      ...batch,
+      autoImport,
+    });
+    info(`Batch ${batch.batchId} became available`, {
+      problemCount: batch.problems.length,
+      autoImport,
+    });
+  },
+  onBatchRemoved: (batchId, reason) => {
+    io?.to('vscode-clients').emit('batchRemoved', { batchId, reason });
+    info(`Batch ${batchId} removed`, { reason });
+  },
+});
 
 const refreshAllStatus = () => {
   if (!io) return;
@@ -195,6 +213,7 @@ const stopServer = async (reason: string) => {
   io = undefined;
   const currentServer = server;
   server = undefined;
+  batchStore.dispose();
   await closeRuntime(currentServer, currentIo);
 
   if (releaseLogFileLock) {
@@ -213,6 +232,8 @@ app.use('/*', cors());
 app.get('/', (ctx) => {
   const browserRoom = io?.sockets.adapter.rooms.get('browsers') || new Set();
   const vscodeRoom = io?.sockets.adapter.rooms.get('vscode-clients') || new Set();
+  const pendingBatches = batchStore.getPendingDebugSnapshot();
+  const availableBatches = batchStore.getSnapshot();
   const html = `
     <html>
       <head>
@@ -256,13 +277,26 @@ app.get('/', (ctx) => {
             .join('')}
         </ul>
         <h3>Pending Batches</h3>
-        <p>Count: ${batches.size} batch(es)</p>
+        <p>Count: ${pendingBatches.length} batch(es)</p>
         <ul>
-          ${[...batches.entries()]
+          ${pendingBatches
             .map(
-              ([batchId, batch]) => `
+              (batch) => `
             <li>
-              <pre>${batchId}</pre> ${batch.problems.length}/${batch.size} problems${batch.ignored ? ' (ignored)' : ''}
+              <pre>${batch.batchId}</pre> ${batch.count}/${batch.size} problems
+            </li>
+          `,
+            )
+            .join('')}
+        </ul>
+        <h3>Available Batches</h3>
+        <p>Count: ${availableBatches.length} batch(es)</p>
+        <ul>
+          ${availableBatches
+            .map(
+              (batch) => `
+            <li>
+              <pre>${batch.batchId}</pre> ${batch.problems.length} problem(s) ready
             </li>
           `,
             )
@@ -276,31 +310,11 @@ app.get('/', (ctx) => {
 
 app.post('/', async (ctx) => {
   const body: CompanionProblem = await ctx.req.json();
-  const { id, size } = body.batch;
-
-  const batch = batches.get(id) || { ignored: false, problems: [] as CompanionProblem[], size };
-  if (batch.problems.length === 0) batches.set(id, batch);
-  batch.problems.push(body);
-
-  if (size !== 1 && !batch.ignored) {
-    io?.to('vscode-clients').emit('readingBatch', {
-      batchId: id,
-      count: batch.problems.length,
-      size,
-    });
-  }
-
-  if (batch.problems.length >= size) {
-    if (!batch.ignored) {
-      io?.to('vscode-clients').emit('batchAvailable', {
-        batchId: id,
-        problems: [...batch.problems],
-        autoImport: getRoomSize('vscode-clients') === 1,
-      });
-      info(`Batch ${id} dispatched`, { size });
-    }
-    batches.delete(id);
-  }
+  const status = batchStore.submit(body);
+  if (status === 'duplicate')
+    trace('Ignored duplicate companion batch payload', { batchId: body.batch.id });
+  else if (status === 'ignored')
+    trace('Ignored finalized companion batch payload', { batchId: body.batch.id });
   return ctx.json({ status: 'ok' });
 });
 
@@ -314,6 +328,7 @@ const attachSocketHandlers = (targetIo: Server<C2rMsg & B2rMsg, R2cMsg & R2bMsg>
       info('VSCode connected', { id: socket.id });
 
       socket.emit('browserStatus', { connected: !!activeBrowserId });
+      socket.emit('batchSnapshot', { batches: batchStore.getSnapshot() });
       socket.on('submit', (msg: Parameters<C2rMsg['submit']>[0]) => {
         if (activeBrowserId) {
           io?.to(activeBrowserId).emit('submitRequest', msg);
@@ -321,22 +336,20 @@ const attachSocketHandlers = (targetIo: Server<C2rMsg & B2rMsg, R2cMsg & R2bMsg>
         } else error('No browser connected');
       });
       socket.on('cancelBatch', ({ batchId }: Parameters<C2rMsg['cancelBatch']>[0]) => {
-        const batch = batches.get(batchId);
-        if (batch) {
-          batch.ignored = true;
-          io?.to('vscode-clients').emit('readingBatch', {
-            batchId,
-            count: batch.size + 1,
-            size: batch.size,
-          });
-          info(`Batch ${batchId} marked as ignored due to cancellation`, {
-            pendingProblems: batch.problems.length,
-          });
-        } else warn(`Batch ${batchId} not found for cancellation`, { batchId });
+        if (!batchStore.cancel(batchId))
+          warn(`Batch ${batchId} not found for cancellation`, { batchId });
       });
-      socket.on('claimBatch', ({ batchId }: Parameters<C2rMsg['claimBatch']>[0]) => {
-        io?.to('vscode-clients').emit('batchClaimed', { batchId });
-      });
+      socket.on(
+        'claimBatch',
+        (
+          { batchId }: Parameters<C2rMsg['claimBatch']>[0],
+          ack: Parameters<C2rMsg['claimBatch']>[1],
+        ) => {
+          const result = batchStore.claim(batchId);
+          if (!result.ok) warn(`Batch ${batchId} not found for claim`, { batchId });
+          ack(result);
+        },
+      );
       socket.on(
         'updateConfig',
         async ({ config: nextConfig }: Parameters<C2rMsg['updateConfig']>[0]) => {
